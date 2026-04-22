@@ -12,5 +12,8 @@ class Settings(BaseSettings):
     mcp_server_name: str = "zeronoise"
     mcp_transport: str = "stdio"  # "stdio" | "sse"
 
+    # Stage 3 gate — minimum confidence required to allow contextual LLM analysis
+    stage3_confidence_threshold: float = 0.70
+
 
 settings = Settings()
