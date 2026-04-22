@@ -1,10 +1,27 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ImportUsage(BaseModel):
     file: str
     line: int
     statement: str
+    matched_pattern: str = Field(
+        default="",
+        description="Name of the regex pattern that matched (require | import_from | import_dynamic | import_side_effect)",
+    )
+    reason: str = Field(
+        default="",
+        description="Human-readable explanation of why this usage was flagged",
+    )
+
+
+class ReproducibilityMetadata(BaseModel):
+    """Fingerprint that allows audit systems to reproduce or compare analysis runs."""
+    analyzer_name: str
+    analyzer_version: str
+    ruleset_version: str
+    timestamp: str  # ISO 8601
+    input_fingerprint: str  # sha256 of (project_path + package + file list)
 
 
 class ReachabilityResult(BaseModel):
@@ -13,6 +30,11 @@ class ReachabilityResult(BaseModel):
     is_reachable: bool
     files_scanned: int
     usages: list[ImportUsage]
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    confidence_reason: str = ""
+    limitations: list[str] = Field(default_factory=list)
+    requires_human_review: bool = False
+    reproducibility: ReproducibilityMetadata | None = None
 
     @property
     def verdict(self) -> str:
