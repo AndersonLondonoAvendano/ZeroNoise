@@ -24,29 +24,50 @@ import re
 from pathlib import Path
 
 from zeronoise.audit import audit_tool
-from zeronoise.analyzers.js_import_scanner import scan_project
+from zeronoise.analyzers.scanner_factory import detect_language, get_scanner
 from zeronoise.models.security_policy import DEFAULT_POLICY
 
-# Patterns that indicate user-controlled input nearby a call site
-_USER_INPUT_PATTERNS = re.compile(
+# ── JavaScript / Node.js / Express patterns ───────────────────────────────────
+_USER_INPUT_JS = re.compile(
     r"""req\.(body|query|params|headers|files|cookies)|"""
     r"""request\.(body|query|data|form|json|files)|"""
     r"""ctx\.(request|query|params|body)|"""
-    r"""process\.argv|"""
-    r"""readline|"""
-    r"""stdin|"""
-    r"""event\.(target|data|body)|"""
-    r"""socket\.(data|message)""",
+    r"""process\.argv|readline|stdin|"""
+    r"""event\.(target|data|body)|socket\.(data|message)""",
+    re.IGNORECASE,
+)
+_SANITIZE_JS = re.compile(
+    r"""sanitize|escape|validate|whitelist|allowlist|"""
+    r"""\.replace\(|\.slice\(|path\.basename|isValid|isSafe|checkPath|normalize""",
     re.IGNORECASE,
 )
 
-# Patterns that suggest sanitization / validation is present
-_SANITIZE_PATTERNS = re.compile(
-    r"""sanitize|escape|validate|whitelist|allowlist|"""
-    r"""\.replace\(|\.slice\(|path\.basename|"""
-    r"""isValid|isSafe|checkPath|normalize""",
+# ── Java / Spring Boot patterns ───────────────────────────────────────────────
+_USER_INPUT_JAVA = re.compile(
+    r"""@RequestParam|@RequestBody|@PathVariable|@RequestHeader|"""
+    r"""@ModelAttribute|@RequestPart|MultipartFile|"""
+    r"""request\.getParameter|request\.getInputStream|request\.getReader|"""
+    r"""getQueryString|getServletPath|getHeader|getCookies|"""
+    r"""HttpServletRequest|ServletRequest|System\.in""",
     re.IGNORECASE,
 )
+_SANITIZE_JAVA = re.compile(
+    r"""@Valid|@Validated|BindingResult|Errors\b|Validator|"""
+    r"""StringEscapeUtils|HtmlUtils|ESAPI|AntiSamy|"""
+    r"""@Pattern|@NotNull|@NotBlank|@Size|@Min|@Max|@Email|"""
+    r"""javax\.validation|jakarta\.validation|"""
+    r"""Paths\.get|Path\.normalize|FilenameUtils\.getName|"""
+    r"""sanitize|validate|whitelist|allowlist""",
+    re.IGNORECASE,
+)
+
+
+def _user_input_pattern(language: str) -> re.Pattern:
+    return _USER_INPUT_JAVA if language == "java" else _USER_INPUT_JS
+
+
+def _sanitize_pattern(language: str) -> re.Pattern:
+    return _SANITIZE_JAVA if language == "java" else _SANITIZE_JS
 
 _CONTEXT_RADIUS = 6  # lines before/after a call site
 
@@ -73,13 +94,16 @@ def _snippet(lines: list[str], center: int, radius: int = _CONTEXT_RADIUS) -> li
 def _find_call_sites(
     lines: list[str],
     function_names: list[str],
+    language: str,
 ) -> list[dict]:
-    """Locate call sites for known vulnerable functions."""
+    """Locate call sites for known vulnerable functions using language-aware signals."""
     sites: list[dict] = []
     if not function_names:
         return sites
+    ui_pattern = _user_input_pattern(language)
+    san_pattern = _sanitize_pattern(language)
     pattern = re.compile(
-        r"""\b(?:""" + "|".join(re.escape(fn) for fn in function_names) + r""")\s*\("""
+        r"""\b(?:""" + "|".join(re.escape(fn) for fn in function_names) + r""")\s*[\(\.]"""
     )
     for line_no, line in enumerate(lines, start=1):
         m = pattern.search(line)
@@ -87,13 +111,13 @@ def _find_call_sites(
             ctx = _snippet(lines, line_no)
             ctx_text = "\n".join(c["code"] for c in ctx)
             sites.append({
-                "function": m.group(0).rstrip("(").strip(),
+                "function": m.group(0).rstrip("(.").strip(),
                 "line": line_no,
                 "statement": line.strip()[:200],
                 "context": ctx,
                 "analysis_hints": {
-                    "near_user_input": bool(_USER_INPUT_PATTERNS.search(ctx_text)),
-                    "sanitization_present": bool(_SANITIZE_PATTERNS.search(ctx_text)),
+                    "near_user_input": bool(ui_pattern.search(ctx_text)),
+                    "sanitization_present": bool(san_pattern.search(ctx_text)),
                 },
             })
             if len(sites) >= 10:
@@ -106,6 +130,7 @@ def _build_context_bundle(
     root: Path,
     import_usage: dict,
     vulnerable_functions: list[str],
+    language: str,
 ) -> dict | None:
     lines = _read_lines(file_path)
     if lines is None:
@@ -115,17 +140,20 @@ def _build_context_bundle(
     import_line = import_usage["line"]
     import_ctx = _snippet(lines, import_line, radius=3)
 
-    # Determine what the package is bound to (e.g. `const AdmZip = require(...)`)
     import_stmt = lines[import_line - 1] if import_line <= len(lines) else ""
-    binding_match = re.search(r"""(?:const|let|var)\s+(\w+)\s*=""", import_stmt)
-    local_binding = binding_match.group(1) if binding_match else None
 
-    # Look for call sites using the local binding OR the vulnerable function names
+    # JS: detect local binding (e.g. `const AdmZip = require(...)`)
+    # Java: no local binding needed — class is used by simple name
+    local_binding: str | None = None
+    if language != "java":
+        binding_match = re.search(r"""(?:const|let|var)\s+(\w+)\s*=""", import_stmt)
+        local_binding = binding_match.group(1) if binding_match else None
+
     search_names = list(vulnerable_functions)
     if local_binding:
         search_names.insert(0, local_binding)
 
-    call_sites = _find_call_sites(lines, search_names) if search_names else []
+    call_sites = _find_call_sites(lines, search_names, language) if search_names else []
 
     return {
         "file": rel_path,
@@ -167,19 +195,25 @@ async def prepare_stage3_context(
 
     Args:
         project_path: Absolute path to the project source root.
-        package_name: npm package name or PURL.
+        package_name: Package name or PURL.
+                      JS: 'adm-zip' or 'pkg:npm/adm-zip@0.4.7'
+                      Java: 'pkg:maven/org.springframework/spring-core@5.3.0'
+                            or 'org.springframework:spring-core'
         vulnerability_id: CVE or advisory ID (e.g. CVE-2018-1002204).
         severity: CRITICAL | HIGH | MEDIUM | LOW.
         vulnerability_description: Plain-text description of the vulnerability.
-        vulnerable_functions: Optional list of specific function names to find
-                              call sites for (e.g. ["extractAllTo", "extractEntryTo"]).
+        vulnerable_functions: Optional list of specific function/method names to find
+                              call sites for (e.g. ["extractAllTo"] for JS,
+                              ["deserialize", "readObject"] for Java).
         cvss: CVSS v3 base score, if available.
     """
     root = Path(project_path).resolve()
     if not root.is_dir():
         return {"error": f"project_path is not a directory: {project_path}"}
 
-    scan_result = scan_project(project_path, package_name)
+    language = detect_language(project_path, package_name)
+    scanner = get_scanner(language)
+    scan_result = scanner.scan_project(project_path, package_name)
 
     if not scan_result.is_reachable:
         return {
@@ -189,6 +223,7 @@ async def prepare_stage3_context(
                 "Only call this tool for REACHABLE findings."
             ),
             "verdict": "NOT_REACHABLE",
+            "language": language,
             "package": scan_result.package,
         }
 
@@ -204,6 +239,7 @@ async def prepare_stage3_context(
             root=root,
             import_usage=usage.model_dump(),
             vulnerable_functions=fn_names,
+            language=language,
         )
         if bundle is not None:
             context_bundles.append(bundle)
@@ -220,9 +256,31 @@ async def prepare_stage3_context(
         for cs in b["vulnerable_function_calls"]
     )
 
+    # Language-specific analysis questions
+    if language == "java":
+        check_for = [
+            "Is the vulnerable method called with user-controlled input (@RequestParam, @RequestBody, @PathVariable)?",
+            "Is there @Valid / @Validated / BindingResult validation before the vulnerable call?",
+            "Is the endpoint secured by Spring Security (@PreAuthorize, SecurityFilterChain)?",
+            "Is the vulnerable code in a @RestController or @Controller (HTTP-exposed)?",
+            "Is deserialization performed on user-supplied data (ObjectInputStream, XStream, Kryo)?",
+            "What Spring Security roles / authorities are required to reach this endpoint?",
+            "Is the vulnerable function actually called, or only the class imported?",
+        ]
+    else:
+        check_for = [
+            "Is the destination/input path user-controlled (req.body, req.query, req.params)?",
+            "Is there validation or sanitization before the vulnerable call?",
+            "Does this code run behind authentication middleware?",
+            "Is the route publicly accessible (no auth check before it)?",
+            "What privilege level does this process run with?",
+            "Is the vulnerable function actually called, or only the package imported?",
+        ]
+
     return {
         "finding": {
             "package": scan_result.package,
+            "language": language,
             "vulnerability_id": vulnerability_id,
             "severity": severity,
             "cvss": cvss,
@@ -249,16 +307,9 @@ async def prepare_stage3_context(
         "analysis_instructions": {
             "objective": (
                 f"Determine whether {vulnerability_id} in '{scan_result.package}' "
-                f"is exploitable in this specific codebase."
+                f"is exploitable in this specific {language} codebase."
             ),
-            "check_for": [
-                "Is the destination/input path user-controlled?",
-                "Is there validation or sanitization before the vulnerable call?",
-                "Does this code run in an authenticated context?",
-                "Is the endpoint publicly accessible (no auth middleware before it)?",
-                "What privilege level does this process run with?",
-                "Is the vulnerable function actually called, or only the package imported?",
-            ],
+            "check_for": check_for,
             "verdict_options": [
                 "NOT_REACHABLE — package imported but vulnerable function never called",
                 "REACHABLE — called but input is validated / sanitized",

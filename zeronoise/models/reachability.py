@@ -35,6 +35,7 @@ class ReachabilityResult(BaseModel):
     limitations: list[str] = Field(default_factory=list)
     requires_human_review: bool = False
     reproducibility: ReproducibilityMetadata | None = None
+    language: str = Field(default="javascript", description="Scanner language: javascript | java | python | go")
 
     @property
     def verdict(self) -> str:
