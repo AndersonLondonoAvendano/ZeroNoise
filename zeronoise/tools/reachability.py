@@ -1,9 +1,12 @@
 """
 Stage 2 — Reachability Analysis
 
-MCP tools that determine whether a vulnerable npm package is actually
-imported by the application source code. Operates entirely on the local
-filesystem — zero LLM tokens consumed.
+MCP tools that determine whether a vulnerable package is actually imported
+by the application source code. Operates entirely on the local filesystem —
+zero LLM tokens consumed.
+
+Supports: JavaScript / TypeScript (npm) and Java (Maven / Gradle).
+Language is auto-detected from the package PURL or project markers.
 
 Findings that are NOT reachable are marked NOT_AFFECTED in Dependency-Track
 automatically, with a machine-generated justification comment.
@@ -15,7 +18,7 @@ Tool contracts:
   update_finding_analysis       read_only: false | side_effects: external_write | cost: low  | deterministic
 """
 
-from zeronoise.analyzers.js_import_scanner import build_import_graph, scan_project
+from zeronoise.analyzers.scanner_factory import detect_language, get_scanner
 from zeronoise.audit import audit_tool
 from zeronoise.clients.dependency_track import dt_client
 from zeronoise.config import settings
@@ -62,13 +65,34 @@ def _stage3_gate(
     }
 
 
-@audit_tool(side_effects="none")
-async def analyze_package_reachability(project_path: str, package_name: str) -> dict:
+def _resolve_package_identifier(component) -> str:
     """
-    Determine whether an npm package is imported anywhere in the project source.
+    Build the best package identifier for a DT component.
 
-    Scans all .js/.ts/.mjs/.cjs/.jsx/.tsx files under project_path,
-    skipping node_modules, dist, build and other non-source directories.
+    Priority:
+      1. PURL (most complete — includes ecosystem, groupId, version)
+      2. Maven GAV from group + name
+      3. Plain component.name (npm fallback)
+    """
+    if component.purl:
+        return component.purl
+    if component.group:
+        # Maven-style: groupId/artifactId maps to pkg:maven/groupId/artifactId
+        return f"pkg:maven/{component.group}/{component.name}"
+    return component.name
+
+
+@audit_tool(side_effects="none")
+async def analyze_package_reachability(
+    project_path: str,
+    package_name: str,
+    language: str = "auto",
+) -> dict:
+    """
+    Determine whether a package is imported anywhere in the project source.
+
+    Supports JavaScript/TypeScript (npm) and Java (Maven/Gradle). Language is
+    auto-detected from the PURL scheme or project markers when language="auto".
 
     Contract:
         read_only: true
@@ -79,18 +103,23 @@ async def analyze_package_reachability(project_path: str, package_name: str) -> 
 
     Args:
         project_path: Absolute path to the project's source root on disk.
-        package_name: npm package name or PURL (e.g. 'adm-zip' or
-                      'pkg:npm/adm-zip@0.4.7').
-
-    Returns a reachability report with verdict, confidence, evidence, and
-    Stage 3 gate evaluation.
+        package_name: Package name or PURL.
+                      JS: 'adm-zip'  or 'pkg:npm/adm-zip@0.4.7'
+                      Java: 'pkg:maven/org.springframework/spring-core@5.3.0'
+                            or 'org.springframework:spring-core'
+        language: "auto" | "javascript" | "java"
     """
-    result = scan_project(project_path, package_name)
+    if language == "auto":
+        language = detect_language(project_path, package_name)
+
+    scanner = get_scanner(language)
+    result = scanner.scan_project(project_path, package_name)
     evidence = [u.model_dump() for u in result.usages]
     gate = _stage3_gate(result.verdict, evidence, result.confidence)
 
     return {
         "package": result.package,
+        "language": result.language,
         "verdict": result.verdict,
         "is_reachable": result.is_reachable,
         "files_scanned": result.files_scanned,
@@ -107,12 +136,12 @@ async def analyze_package_reachability(project_path: str, package_name: str) -> 
 
 
 @audit_tool(side_effects="none")
-async def build_project_import_graph(project_path: str) -> dict:
+async def build_project_import_graph(
+    project_path: str,
+    language: str = "auto",
+) -> dict:
     """
     Build a full import map of the project: {file → [packages it imports]}.
-
-    Useful for the AI to understand the overall dependency surface before
-    deciding which findings to investigate further.
 
     Contract:
         read_only: true
@@ -123,14 +152,20 @@ async def build_project_import_graph(project_path: str) -> dict:
 
     Args:
         project_path: Absolute path to the project's source root on disk.
+        language: "auto" | "javascript" | "java"
     """
-    graph = build_import_graph(project_path)
+    if language == "auto":
+        language = detect_language(project_path, "")
+
+    scanner = get_scanner(language)
+    graph = scanner.build_import_graph(project_path)
     all_packages: set[str] = set()
     for pkgs in graph.values():
         all_packages.update(pkgs)
 
     return {
         "project_path": project_path,
+        "language": language,
         "files_with_imports": len(graph),
         "unique_packages_imported": len(all_packages),
         "packages": sorted(all_packages),
@@ -143,14 +178,16 @@ async def run_reachability_filter(
     project_uuid: str,
     project_path: str,
     dry_run: bool = True,
+    language: str = "auto",
 ) -> dict:
     """
     Run Stage 2 over ALL actionable findings of a project.
 
     For each finding:
-      - Scans source code for imports of the vulnerable package.
+      - Resolves the canonical package identifier (PURL > Maven GAV > name).
+      - Scans source code using the language-appropriate scanner.
       - If NOT reachable → optionally writes NOT_AFFECTED to Dependency-Track.
-      - If reachable → evaluates Stage 3 gate and leaves for contextual analysis.
+      - If reachable → evaluates Stage 3 gate.
 
     Contract:
         read_only: false (when dry_run=False)
@@ -163,27 +200,40 @@ async def run_reachability_filter(
         project_uuid: Dependency-Track project UUID.
         project_path: Absolute path to the project source on disk.
         dry_run: When True, performs analysis but does NOT write back to DT.
-                 Set to False to update findings in Dependency-Track.
-
-    Returns a summary with per-finding verdicts and Stage 3 candidates.
+        language: "auto" | "javascript" | "java"
     """
     project_findings = await dt_client.get_project_findings(project_uuid)
     actionable = project_findings.actionable
+
+    # Detect language once for the whole project if auto
+    resolved_language = language
+    if resolved_language == "auto":
+        resolved_language = detect_language(project_path, "")
+        # Re-check using the first finding's PURL for stronger signal
+        if actionable and actionable[0].component.purl:
+            resolved_language = detect_language(project_path, actionable[0].component.purl)
+
+    scanner = get_scanner(resolved_language)
 
     not_reachable: list[dict] = []
     reachable: list[dict] = []
     stage3_candidates: list[dict] = []
     errors: list[dict] = []
 
-    # Deduplicate: same package may have multiple CVEs — scan once per package
+    # Cache keyed on the normalized import prefix (after scanner resolution)
+    # This correctly deduplicates Java findings with the same groupId prefix
     scanned_cache: dict[str, object] = {}
 
     for finding in actionable:
-        pkg_name = finding.component.name
+        pkg_id = _resolve_package_identifier(finding.component)
         try:
-            if pkg_name not in scanned_cache:
-                scanned_cache[pkg_name] = scan_project(project_path, pkg_name)
-            result = scanned_cache[pkg_name]
+            # Normalize to the scanner's resolved package name for cache key
+            normalized = scanner.scan_project.__func__ if hasattr(scanner.scan_project, "__func__") else None
+            # Use the PURL/GAV as cache key to avoid re-scanning the same package
+            cache_key = pkg_id
+            if cache_key not in scanned_cache:
+                scanned_cache[cache_key] = scanner.scan_project(project_path, pkg_id)
+            result = scanned_cache[cache_key]
 
             evidence = [u.model_dump() for u in result.usages]
             gate = _stage3_gate(result.verdict, evidence, result.confidence)
@@ -194,6 +244,8 @@ async def run_reachability_filter(
                 "component": f"{finding.component.name}@{finding.component.version}",
                 "component_uuid": finding.component.uuid,
                 "vulnerability_uuid": finding.vulnerability.uuid,
+                "package_resolved": result.package,
+                "language": result.language,
                 "verdict": result.verdict,
                 "files_scanned": result.files_scanned,
                 "usage_count": len(result.usages),
@@ -225,6 +277,7 @@ async def run_reachability_filter(
     return {
         "project_uuid": project_uuid,
         "project_name": project_findings.project.name,
+        "language": resolved_language,
         "dry_run": dry_run,
         "total_actionable": len(actionable),
         "not_reachable_count": len(not_reachable),

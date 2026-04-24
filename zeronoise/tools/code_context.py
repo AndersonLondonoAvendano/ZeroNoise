@@ -131,12 +131,23 @@ async def get_function_context(
     except OSError as exc:
         return {"error": str(exc)}
 
-    # Heuristic: find function/method definition line
-    fn_pattern = re.compile(
-        rf"""(?:function\s+{re.escape(function_name)}\s*\(|"""
-        rf"""(?:const|let|var)\s+{re.escape(function_name)}\s*=\s*(?:async\s*)?\(|"""
-        rf"""{re.escape(function_name)}\s*[:(]\s*(?:async\s*)?\()"""
-    )
+    # Language detection from file extension
+    is_java = target.suffix == ".java"
+
+    if is_java:
+        # Java: method declarations with any combination of modifiers
+        # public/private/protected [static] [final] [synchronized] ReturnType methodName(
+        fn_pattern = re.compile(
+            rf"""(?:(?:public|private|protected|static|final|synchronized|abstract|native|default)\s+)*"""
+            rf"""[\w\[\]<>,\s]+\s+{re.escape(function_name)}\s*\("""
+        )
+    else:
+        # JavaScript / TypeScript
+        fn_pattern = re.compile(
+            rf"""(?:function\s+{re.escape(function_name)}\s*\(|"""
+            rf"""(?:const|let|var)\s+{re.escape(function_name)}\s*=\s*(?:async\s*)?\(|"""
+            rf"""{re.escape(function_name)}\s*[:(]\s*(?:async\s*)?\()"""
+        )
 
     matches: list[dict] = []
     for line_no, line in enumerate(lines, start=1):
@@ -256,14 +267,25 @@ async def find_symbol_usages(
     Args:
         project_path: Absolute path to the project root.
         symbol_name: Function, class, or variable name to search for.
-        file_extension: Optional filter (e.g. '.ts'). Empty = all source files.
+        file_extension: Optional filter (e.g. '.ts', '.java'). Empty = all source files
+                        detected by the language-appropriate scanner.
     """
-    from zeronoise.analyzers.js_import_scanner import _source_files
+    from zeronoise.analyzers.scanner_factory import detect_language, get_scanner
     from zeronoise.models.security_policy import DEFAULT_POLICY
 
     root = Path(project_path).resolve()
     if not root.is_dir():
         return {"error": f"project_path is not a directory: {project_path}"}
+
+    # Use the language-appropriate scanner to enumerate source files
+    language = detect_language(project_path, "")
+    scanner = get_scanner(language, DEFAULT_POLICY)
+
+    # Access internal _source_files via the scanner's module
+    if language == "java":
+        from zeronoise.analyzers.java_import_scanner import _source_files
+    else:
+        from zeronoise.analyzers.js_import_scanner import _source_files
 
     files = _source_files(root, DEFAULT_POLICY)
     if file_extension:
