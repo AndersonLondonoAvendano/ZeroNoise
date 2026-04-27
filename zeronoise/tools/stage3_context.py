@@ -23,9 +23,14 @@ LLM Usage Policy enforced here:
 import re
 from pathlib import Path
 
-from zeronoise.audit import audit_tool
+from zeronoise.audit import audit_tool, safe_tool
 from zeronoise.analyzers.scanner_factory import detect_language, get_scanner
 from zeronoise.models.security_policy import DEFAULT_POLICY
+from zeronoise.tools._validators import (
+    _validate_package_name,
+    _validate_project_path,
+    _validate_vulnerability_id,
+)
 
 # ── JavaScript / Node.js / Express patterns ───────────────────────────────────
 _USER_INPUT_JS = re.compile(
@@ -167,6 +172,7 @@ def _build_context_bundle(
     }
 
 
+@safe_tool
 @audit_tool(side_effects="none")
 async def prepare_stage3_context(
     project_path: str,
@@ -207,6 +213,16 @@ async def prepare_stage3_context(
                               ["deserialize", "readObject"] for Java).
         cvss: CVSS v3 base score, if available.
     """
+    _validate_project_path(project_path)
+    _validate_package_name(package_name)
+    _validate_vulnerability_id(vulnerability_id)
+
+    allowed_severities = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNASSIGNED"}
+    if severity not in allowed_severities:
+        raise ValueError(
+            f"severity inválido: {severity!r}. Valores permitidos: {sorted(allowed_severities)}"
+        )
+
     root = Path(project_path).resolve()
     if not root.is_dir():
         return {"error": f"project_path is not a directory: {project_path}"}

@@ -59,4 +59,28 @@ ZeroNoise actúa como un **Security Gatekeeper** en tu flujo de CI/CD:
 
 ---
 
-> **Estado del Proyecto:** En desarrollo. Implementando servidores MCP para integración con repositorios Git y conectores de Dependency-Track.
+## Seguridad del Motor
+
+ZeroNoise analiza código fuente empresarial confidencial y es consumido por LLMs externos. Los controles de seguridad implementados cubren tres dominios:
+
+### Confidencialidad
+* **Path traversal prevention** — Todas las rutas de filesystem pasan por validación multicapa: rechazo explícito de `..`, `~`, null bytes y shell chars, más verificación post-resolución contra el project root.
+* **Sanitización anti prompt-injection** — Los snippets de código retornados al LLM llevan `type: "code_snippet"` y un campo `warning` explícito para que el modelo los trate como datos, no como instrucciones.
+* **Credential masking en audit.log** — Las claves sensibles (`api_key`, `token`, `password`, etc.) se reemplazan con `***REDACTED***` antes de escribir en el log de auditoría.
+* **Permisos restrictivos** — `audit.log` se crea con `chmod 0o600` al arrancar el servidor.
+
+### Integridad
+* **Validación estricta de inputs** — UUID v4, paths absolutos existentes, IDs de vulnerabilidad en formato CVE/GHSA, rangos de líneas acotados. Implementado en `tools/_validators.py` y aplicado al inicio de cada tool.
+* **Inmutabilidad de verdicts** — Los estados de análisis solo pueden avanzar en severidad (`NOT_SET → IN_TRIAGE → NOT_AFFECTED → EXPLOITABLE`). Un EXPLOITABLE nunca puede ser revertido a NOT_AFFECTED.
+* **Hash de integridad VEX** — El reporte OpenVEX que autoriza o bloquea el deploy incluye un SHA-256 de su contenido para detección de tampering.
+* **Rate limiting por sesión** — Las tools de acceso a código (`fetch_code_snippet`, `get_function_context`, etc.) tienen límites de invocación por sesión MCP para prevenir exfiltración de código en bucle.
+
+### Disponibilidad
+* **Timeouts httpx estructurados** — `connect: 5s / read: 30s / write: 10s / pool: 5s` en todas las llamadas a Dependency-Track.
+* **`@safe_tool` decorator** — Ninguna excepción no manejada puede crashear el servidor MCP. Los errores se convierten en respuestas estructuradas y se loggean internamente.
+* **Paginación defensiva** — Stage 1 retorna máximo 50 findings por llamada (configurable) para evitar saturar el contexto del LLM consumidor.
+* **Fail-fast al arranque** — El servidor detecta configuraciones inseguras (SSE en `0.0.0.0`, `.env` con permisos excesivos) antes de aceptar conexiones.
+
+---
+
+> **Estado del Proyecto:** Stage 1, Stage 2 y Stage 3 implementados y validados. Controles de seguridad CIA implementados. Lenguajes soportados: JavaScript/TypeScript y Java (Spring/Maven/Gradle).
