@@ -9,9 +9,11 @@ Tool contracts:
   generate_vex_report        read_only: false | side_effects: external_write | cost: low  | deterministic
 """
 
+import hashlib
+import json
 from datetime import datetime, timezone
 
-from zeronoise.audit import audit_tool
+from zeronoise.audit import audit_tool, safe_tool
 from zeronoise.config import settings
 from zeronoise.models.vulnerability import AnalysisJustification, VerdictTaxonomy
 
@@ -80,6 +82,23 @@ def _check_stage3_gate(
     }
 
 
+def _add_vex_integrity(vex_report: dict) -> dict:
+    """
+    Embed a SHA-256 hash of the report content for tamper detection.
+
+    Hash is computed BEFORE adding the 'integrity' field to avoid circularity,
+    then the field is appended. Verifiers must remove 'integrity' before re-hashing.
+    """
+    content_bytes = json.dumps(vex_report, sort_keys=True, ensure_ascii=True).encode()
+    vex_report["integrity"] = {
+        "algorithm": "sha256",
+        "hash": hashlib.sha256(content_bytes).hexdigest(),
+        "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+    }
+    return vex_report
+
+
+@safe_tool
 @audit_tool(side_effects="none")
 async def generate_finding_verdict(
     finding_id: str,
@@ -110,6 +129,11 @@ async def generate_finding_verdict(
         evidence: List of evidence dicts (file, line, statement, matched_pattern, reason).
         analysis_details: Free-form text for the DT audit trail.
     """
+    if not finding_id or not finding_id.strip():
+        raise ValueError("finding_id no puede estar vacío")
+    if not isinstance(confidence, (int, float)) or not (0.0 <= confidence <= 1.0):
+        raise ValueError(f"confidence debe ser un float entre 0.0 y 1.0, recibido: {confidence!r}")
+
     allowed_verdicts = [v.value for v in VerdictTaxonomy]
     if verdict not in allowed_verdicts:
         return {"error": f"Invalid verdict '{verdict}'. Must be one of: {allowed_verdicts}"}
@@ -136,6 +160,7 @@ async def generate_finding_verdict(
     }
 
 
+@safe_tool
 @audit_tool(side_effects="none")
 async def generate_vex_report(
     project_name: str,
@@ -147,6 +172,8 @@ async def generate_vex_report(
 
     The output follows the OpenVEX schema structure and can be embedded
     in CI/CD pipelines to justify security gate decisions without manual review.
+
+    An SHA-256 integrity hash is embedded in the report for tamper detection.
 
     Contract:
         read_only: true
@@ -162,6 +189,11 @@ async def generate_vex_report(
                   vuln_id, purl, verdict, justification, analysis_details,
                   confidence.
     """
+    if not project_name or not project_name.strip():
+        raise ValueError("project_name no puede estar vacío")
+    if not isinstance(findings, list):
+        raise TypeError("findings debe ser una lista")
+
     timestamp = datetime.now(timezone.utc).isoformat()
 
     statements = []
@@ -196,7 +228,7 @@ async def generate_vex_report(
     not_affected = [s for s in statements if s["status"] == "not_affected"]
     under_investigation = [s for s in statements if s["status"] == "under_investigation"]
 
-    return {
+    report = {
         "@context": "https://openvex.dev/ns/v0.2.0",
         "id": f"zeronoise-vex-{project_name}-{project_version}-{timestamp[:10]}",
         "author": "ZeroNoise",
@@ -213,3 +245,6 @@ async def generate_vex_report(
         "pipeline_decision": "BLOCK" if exploitable else "PROMOTE",
         "statements": statements,
     }
+
+    # Embed SHA-256 integrity hash — computed before adding the 'integrity' field
+    return _add_vex_integrity(report)

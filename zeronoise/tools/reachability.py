@@ -19,10 +19,32 @@ Tool contracts:
 """
 
 from zeronoise.analyzers.scanner_factory import detect_language, get_scanner
-from zeronoise.audit import audit_tool
+from zeronoise.audit import audit_tool, safe_tool
 from zeronoise.clients.dependency_track import dt_client
 from zeronoise.config import settings
+from zeronoise.tools._validators import (
+    _validate_package_name,
+    _validate_project_path,
+    _validate_uuid,
+)
 
+# ── Verdict immutability ───────────────────────────────────────────────────────
+# Verdicts can only advance in severity — never be downgraded.
+_STATE_HIERARCHY: dict[str, int] = {
+    "NOT_SET": 0,
+    "IN_TRIAGE": 1,
+    "NOT_AFFECTED": 2,
+    "FALSE_POSITIVE": 2,
+    "EXPLOITABLE": 3,
+}
+
+
+def _can_overwrite(current_state: str, new_state: str) -> bool:
+    """Return True only if new_state has equal or greater severity than current_state."""
+    return _STATE_HIERARCHY.get(new_state, 0) >= _STATE_HIERARCHY.get(current_state, 0)
+
+
+# ── Stage 3 gate ───────────────────────────────────────────────────────────────
 
 def _stage3_gate(
     verdict: str,
@@ -82,6 +104,9 @@ def _resolve_package_identifier(component) -> str:
     return component.name
 
 
+# ── Tools ──────────────────────────────────────────────────────────────────────
+
+@safe_tool
 @audit_tool(side_effects="none")
 async def analyze_package_reachability(
     project_path: str,
@@ -109,6 +134,9 @@ async def analyze_package_reachability(
                             or 'org.springframework:spring-core'
         language: "auto" | "javascript" | "java"
     """
+    _validate_project_path(project_path)
+    _validate_package_name(package_name)
+
     if language == "auto":
         language = detect_language(project_path, package_name)
 
@@ -135,6 +163,7 @@ async def analyze_package_reachability(
     }
 
 
+@safe_tool
 @audit_tool(side_effects="none")
 async def build_project_import_graph(
     project_path: str,
@@ -154,6 +183,8 @@ async def build_project_import_graph(
         project_path: Absolute path to the project's source root on disk.
         language: "auto" | "javascript" | "java"
     """
+    _validate_project_path(project_path)
+
     if language == "auto":
         language = detect_language(project_path, "")
 
@@ -173,6 +204,7 @@ async def build_project_import_graph(
     }
 
 
+@safe_tool
 @audit_tool(side_effects="external_write")
 async def run_reachability_filter(
     project_uuid: str,
@@ -202,6 +234,9 @@ async def run_reachability_filter(
         dry_run: When True, performs analysis but does NOT write back to DT.
         language: "auto" | "javascript" | "java"
     """
+    _validate_uuid(project_uuid, "project_uuid")
+    _validate_project_path(project_path)
+
     project_findings = await dt_client.get_project_findings(project_uuid)
     actionable = project_findings.actionable
 
@@ -227,8 +262,6 @@ async def run_reachability_filter(
     for finding in actionable:
         pkg_id = _resolve_package_identifier(finding.component)
         try:
-            # Normalize to the scanner's resolved package name for cache key
-            normalized = scanner.scan_project.__func__ if hasattr(scanner.scan_project, "__func__") else None
             # Use the PURL/GAV as cache key to avoid re-scanning the same package
             cache_key = pkg_id
             if cache_key not in scanned_cache:
@@ -258,14 +291,24 @@ async def run_reachability_filter(
             if not result.is_reachable:
                 not_reachable.append(record)
                 if not dry_run:
-                    await dt_client.update_analysis(
-                        project_uuid=project_uuid,
-                        component_uuid=finding.component.uuid,
-                        vulnerability_uuid=finding.vulnerability.uuid,
-                        state="NOT_AFFECTED",
-                        justification="CODE_NOT_REACHABLE",
-                        details=result.auto_justification,
-                    )
+                    current_state = str(finding.analysis_state)
+                    if _can_overwrite(current_state, "NOT_AFFECTED"):
+                        await dt_client.update_analysis(
+                            project_uuid=project_uuid,
+                            component_uuid=finding.component.uuid,
+                            vulnerability_uuid=finding.vulnerability.uuid,
+                            state="NOT_AFFECTED",
+                            justification="CODE_NOT_REACHABLE",
+                            details=result.auto_justification,
+                        )
+                    else:
+                        errors.append({
+                            "vuln_id": finding.vulnerability.vuln_id,
+                            "error": (
+                                f"Overwrite bloqueado: estado actual '{current_state}' "
+                                f"tiene mayor severidad que 'NOT_AFFECTED'."
+                            ),
+                        })
             else:
                 reachable.append(record)
                 if gate["stage3_allowed"]:
@@ -295,6 +338,7 @@ async def run_reachability_filter(
     }
 
 
+@safe_tool
 @audit_tool(side_effects="external_write")
 async def update_finding_analysis(
     project_uuid: str,
@@ -306,6 +350,9 @@ async def update_finding_analysis(
 ) -> dict:
     """
     Manually write a reachability verdict for a single finding in Dependency-Track.
+
+    Enforces verdict immutability: the current state in DT is fetched before writing.
+    A verdict can only advance in severity — it cannot be downgraded.
 
     Contract:
         read_only: false
@@ -319,6 +366,36 @@ async def update_finding_analysis(
         details: Human-readable justification written to the DT analysis comment.
         suppressed: Whether to suppress the finding from the dashboard.
     """
+    _validate_uuid(project_uuid, "project_uuid")
+    _validate_uuid(component_uuid, "component_uuid")
+    _validate_uuid(vulnerability_uuid, "vulnerability_uuid")
+
+    allowed_states = {"NOT_AFFECTED", "IN_TRIAGE", "EXPLOITABLE", "FALSE_POSITIVE", "NOT_SET"}
+    if state not in allowed_states:
+        raise ValueError(
+            f"state inválido: {state!r}. Valores permitidos: {sorted(allowed_states)}"
+        )
+
+    # Fetch current state to enforce immutability
+    current_analysis = await dt_client.get_analysis(
+        project_uuid=project_uuid,
+        component_uuid=component_uuid,
+        vulnerability_uuid=vulnerability_uuid,
+    )
+    current_state = current_analysis.get("analysisState", "NOT_SET")
+
+    if not _can_overwrite(current_state, state):
+        return {
+            "blocked": True,
+            "reason": (
+                f"Overwrite bloqueado: el estado actual '{current_state}' tiene mayor "
+                f"severidad que el nuevo estado '{state}'. "
+                "Los verdicts no pueden retroceder a menor severidad."
+            ),
+            "current_state": current_state,
+            "requested_state": state,
+        }
+
     justification = "CODE_NOT_REACHABLE" if state == "NOT_AFFECTED" else "NOT_SET"
     return await dt_client.update_analysis(
         project_uuid=project_uuid,

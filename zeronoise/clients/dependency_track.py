@@ -15,6 +15,9 @@ from zeronoise.models.vulnerability import (
 _DT_API = f"{settings.dt_base_url.rstrip('/')}/api/v1"
 _HEADERS = {"X-Api-Key": settings.dt_api_key, "Accept": "application/json"}
 
+# Structured timeouts: fast connect, generous read for large finding lists
+_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
+
 
 def _parse_vulnerable_functions(raw: dict) -> list[VulnerableFunction]:
     """
@@ -71,44 +74,62 @@ def _parse_finding(raw: dict) -> Finding:
     )
 
 
+def _safe_url(url: str) -> str:
+    """Return URL with any query params stripped — safe to log without leaking tokens."""
+    return url.split("?")[0]
+
+
 class DependencyTrackClient:
     async def list_projects(self, page_size: int = 100) -> list[Project]:
-        async with httpx.AsyncClient(headers=_HEADERS, timeout=30) as client:
-            params = {"pageSize": page_size, "pageNumber": 1}
-            projects: list[Project] = []
+        try:
+            async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT) as client:
+                params = {"pageSize": page_size, "pageNumber": 1}
+                projects: list[Project] = []
 
-            while True:
-                response = await client.get(f"{_DT_API}/project", params=params)
-                response.raise_for_status()
-                batch = response.json()
-                if not batch:
-                    break
-                projects.extend(
-                    Project(
-                        uuid=p["uuid"],
-                        name=p["name"],
-                        version=p.get("version"),
-                        description=p.get("description"),
-                        active=p.get("active", True),
+                while True:
+                    response = await client.get(f"{_DT_API}/project", params=params)
+                    response.raise_for_status()
+                    batch = response.json()
+                    if not batch:
+                        break
+                    projects.extend(
+                        Project(
+                            uuid=p["uuid"],
+                            name=p["name"],
+                            version=p.get("version"),
+                            description=p.get("description"),
+                            active=p.get("active", True),
+                        )
+                        for p in batch
                     )
-                    for p in batch
-                )
-                if len(batch) < page_size:
-                    break
-                params["pageNumber"] += 1
+                    if len(batch) < page_size:
+                        break
+                    params["pageNumber"] += 1
 
-            return projects
+                return projects
+        except httpx.TimeoutException as exc:
+            url = _safe_url(str(exc.request.url)) if exc.request else _DT_API
+            raise TimeoutError(
+                f"Timeout conectando a Dependency-Track en {url}. "
+                "Verificar que el servidor esté disponible."
+            ) from exc
 
     async def get_project_findings(self, project_uuid: str) -> ProjectFindings:
-        async with httpx.AsyncClient(headers=_HEADERS, timeout=30) as client:
-            proj_resp = await client.get(f"{_DT_API}/project/{project_uuid}")
-            proj_resp.raise_for_status()
-            proj_raw = proj_resp.json()
+        try:
+            async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT) as client:
+                proj_resp = await client.get(f"{_DT_API}/project/{project_uuid}")
+                proj_resp.raise_for_status()
+                proj_raw = proj_resp.json()
 
-            findings_resp = await client.get(
-                f"{_DT_API}/finding/project/{project_uuid}"
-            )
-            findings_resp.raise_for_status()
+                findings_resp = await client.get(
+                    f"{_DT_API}/finding/project/{project_uuid}"
+                )
+                findings_resp.raise_for_status()
+        except httpx.TimeoutException as exc:
+            url = _safe_url(str(exc.request.url)) if exc.request else _DT_API
+            raise TimeoutError(
+                f"Timeout obteniendo findings desde Dependency-Track en {url}."
+            ) from exc
 
         project = Project(
             uuid=proj_raw["uuid"],
@@ -123,12 +144,50 @@ class DependencyTrackClient:
 
     async def get_vulnerability(self, source: str, vuln_id: str) -> dict:
         """Raw vulnerability detail from DT — used for enrichment in Stage 3."""
-        async with httpx.AsyncClient(headers=_HEADERS, timeout=30) as client:
-            response = await client.get(
-                f"{_DT_API}/vulnerability/source/{source}/vuln/{vuln_id}"
-            )
-            response.raise_for_status()
-            return response.json()
+        try:
+            async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT) as client:
+                response = await client.get(
+                    f"{_DT_API}/vulnerability/source/{source}/vuln/{vuln_id}"
+                )
+                response.raise_for_status()
+                return response.json()
+        except httpx.TimeoutException as exc:
+            url = _safe_url(str(exc.request.url)) if exc.request else _DT_API
+            raise TimeoutError(
+                f"Timeout obteniendo detalle de vulnerabilidad desde Dependency-Track en {url}."
+            ) from exc
+
+    async def get_analysis(
+        self,
+        project_uuid: str,
+        component_uuid: str,
+        vulnerability_uuid: str,
+    ) -> dict:
+        """
+        Fetch the current analysis state for a specific finding.
+
+        Returns {"analysisState": "NOT_SET"} when no analysis exists yet (HTTP 404).
+        Used by verdict immutability checks before overwriting an existing state.
+        """
+        try:
+            async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT) as client:
+                response = await client.get(
+                    f"{_DT_API}/analysis",
+                    params={
+                        "component": component_uuid,
+                        "project": project_uuid,
+                        "vulnerability": vulnerability_uuid,
+                    },
+                )
+                if response.status_code == 404:
+                    return {"analysisState": "NOT_SET"}
+                response.raise_for_status()
+                return response.json()
+        except httpx.TimeoutException as exc:
+            url = _safe_url(str(exc.request.url)) if exc.request else _DT_API
+            raise TimeoutError(
+                f"Timeout consultando estado de análisis en Dependency-Track en {url}."
+            ) from exc
 
     async def update_analysis(
         self,
@@ -157,10 +216,16 @@ class DependencyTrackClient:
             "analysisDetails": details,
             "isSuppressed": suppressed,
         }
-        async with httpx.AsyncClient(headers=_HEADERS, timeout=30) as client:
-            response = await client.put(f"{_DT_API}/analysis", json=payload)
-            response.raise_for_status()
-            return response.json()
+        try:
+            async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT) as client:
+                response = await client.put(f"{_DT_API}/analysis", json=payload)
+                response.raise_for_status()
+                return response.json()
+        except httpx.TimeoutException as exc:
+            url = _safe_url(str(exc.request.url)) if exc.request else _DT_API
+            raise TimeoutError(
+                f"Timeout escribiendo análisis en Dependency-Track en {url}."
+            ) from exc
 
 
 dt_client = DependencyTrackClient()
