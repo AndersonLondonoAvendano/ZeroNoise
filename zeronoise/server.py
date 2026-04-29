@@ -19,6 +19,7 @@ from zeronoise.tools.reachability import (
     run_reachability_filter,
     update_finding_analysis,
 )
+from zeronoise.tools.depcheck_gate import analyze_depcheck_report
 from zeronoise.tools.sbom_ingestion import (
     get_actionable_findings,
     get_project_findings,
@@ -52,6 +53,9 @@ mcp.tool()(find_symbol_usages)
 # ── Decision — Verdicts and VEX Report Generation ────────────────────────────
 mcp.tool()(generate_finding_verdict)
 mcp.tool()(generate_vex_report)
+
+# ── Dep-Check Fast Gate ───────────────────────────────────────────────────────
+mcp.tool()(analyze_depcheck_report)
 
 
 # ── Resources ─────────────────────────────────────────────────────────────────
