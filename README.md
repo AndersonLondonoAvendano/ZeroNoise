@@ -32,6 +32,7 @@ Si la función es alcanzable, la IA utiliza **Model Context Protocol (MCP)** par
 
 | Componente | Función | Impacto en Tokens |
 | :--- | :--- | :--- |
+| **Artifact Inspector (Stage 0)** | Verifica la versión real empaquetada en el fat JAR vs. la versión reportada por el scanner. Detecta mismatches y falsos positivos por versión antes de Stage 1. | **Cero** (filesystem local) |
 | **SCA (Dependency-Track)** | Ingesta de SBOM y detección de CVEs. | **Cero** (API local) |
 | **Static Analyzer** | Generación de Call Graph (Mapa de llamadas). | **Cero** |
 | **Orquestador (MCP)** | Decide qué CVEs investigar según el mapa. | **Mínimo** (Metadatos JSON) |
@@ -83,4 +84,4 @@ ZeroNoise analiza código fuente empresarial confidencial y es consumido por LLM
 
 ---
 
-> **Estado del Proyecto:** Stage 1, Stage 2 y Stage 3 implementados y validados. Controles de seguridad CIA implementados. Lenguajes soportados: JavaScript/TypeScript y Java (Spring/Maven/Gradle).
+> **Estado del Proyecto:** Stage 0 (verificación de artefacto), Stage 1, Stage 2 y Stage 3 implementados y validados. Controles de seguridad CIA implementados. Lenguajes soportados: JavaScript/TypeScript, Java (Spring/Maven/Gradle) y Kotlin.

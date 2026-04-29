@@ -61,7 +61,8 @@ zeronoise/
 ├── models/
 │   ├── vulnerability.py         # Finding, VerdictTaxonomy, AnalysisJustification, Evidence
 │   ├── reachability.py          # ReachabilityResult, ImportUsage, ReproducibilityMetadata
-│   └── security_policy.py      # SecurityPolicy — límites de acceso a filesystem
+│   ├── security_policy.py      # SecurityPolicy — límites de acceso a filesystem
+│   └── artifact_finding.py     # Stage 0: VersionVerdict, ArtifactVersion, VersionVerification
 │
 ├── clients/
 │   └── dependency_track.py     # Cliente httpx async para Dependency-Track REST API
@@ -70,7 +71,8 @@ zeronoise/
 │   ├── base_scanner.py         # Clase abstracta ImportScanner (contrato multi-lenguaje)
 │   ├── scanner_factory.py      # detect_language() + get_scanner() factory
 │   ├── js_import_scanner.py    # Scanner JS/TS: require, import, dynamic, side-effect
-│   └── java_import_scanner.py  # Scanner Java: import, import static, import wildcard
+│   ├── java_import_scanner.py  # Scanner Java/Kotlin: import, import static, wildcard (.java, .kt)
+│   └── artifact_inspector.py   # Stage 0: ArtifactInspector — BuildTool detection + fat JAR inspection
 │
 └── tools/                      # Tools MCP — lo que el LLM puede invocar
     ├── sbom_ingestion.py        # Stage 1: list_projects, get_findings, etc.
@@ -438,6 +440,78 @@ near_user_input = true  AND  sanitization_present = false  →  HIGH
 near_user_input = true  AND  sanitization_present = true   →  MEDIUM
 near_user_input = false                                    →  LOW
 ```
+
+---
+
+## Stage 0 — Verificación de versión en artefacto
+
+Antes de que los findings pasen por los stages principales, `ArtifactInspector` verifica si la versión reportada por OWASP Dependency-Check coincide con la versión real empaquetada en el fat JAR compilado.
+
+**Problema que resuelve:** Un scanner puede reportar `thymeleaf@3.4.6` como vulnerable, pero el fat JAR puede contener `thymeleaf@3.4.5` (fuera del rango afectado). Sin esta verificación, ZeroNoise emitiría un veredicto sobre la versión incorrecta.
+
+### BuildTool — Detección del sistema de build
+
+`ArtifactInspector.detect_build_tool()` lee los marcadores en la raíz del proyecto y cachea el resultado:
+
+```
+pom.xml                                 → BuildTool.MAVEN   → busca JAR en target/
+build.gradle / build.gradle.kts         → BuildTool.GRADLE  → busca JAR en build/libs/
+settings.gradle / settings.gradle.kts  → BuildTool.GRADLE
+(ninguno)                               → BuildTool.UNKNOWN → prueba ambas rutas
+```
+
+Las rutas de búsqueda se priorizan según el build tool para no mezclar artefactos de directorios incorrectos:
+
+```python
+_SEARCH_PATHS_BY_TOOL = {
+    "maven":   ["target", "build/libs", "build/outputs", "out/artifacts"],
+    "gradle":  ["build/libs", "build/outputs", "out/artifacts", "target"],
+    "unknown": ["target", "build/libs", "build/outputs", "out/artifacts"],
+}
+```
+
+`find_artifact()` detiene la búsqueda en cuanto encuentra candidatos en el primer directorio válido — evita mezclar artefactos de rutas distintas.
+
+### VersionVerdict — Los 5 posibles resultados
+
+| Valor | Significado | Acción |
+|---|---|---|
+| `CONFIRMED` | Versión reportada == versión real en JAR | Continúa con la versión reportada |
+| `MISMATCH` | Versión reportada != versión real en JAR | Re-evalúa CVE contra versión real |
+| `NOT_FOUND` | El paquete no está en el fat JAR | Posible falso positivo — no está en runtime |
+| `UNVERIFIABLE` | No hay artefacto compilado disponible | Continúa sin verificación (flujo no se interrumpe) |
+| `TRANSITIVELY_RESOLVED` | Versión viene de dependencia transitiva | Documenta la resolución transitiva |
+
+### VersionVerification (modelo central, `models/artifact_finding.py`)
+
+```
+VersionVerification
+├── package_name          : str
+├── reported_version      : str  ← lo que reportó dep-check
+├── real_version          : str | None  ← lo que está en el JAR
+├── verdict               : VersionVerdict
+├── found_in_artifact     : ArtifactVersion | None
+│   ├── artifact_name        : str
+│   ├── resolved_version     : str
+│   ├── source               : "pom_properties" | "jar_filename"
+│   └── jar_path             : str (ruta dentro del fat JAR)
+├── is_starter_wrapper    : bool  (ej: spring-boot-starter-thymeleaf)
+├── actual_library_name   : str | None  (ej: "thymeleaf")
+├── version_is_vulnerable : bool | None
+└── analysis_note         : str  (nota pre-generada para Stage 3)
+
+Properties:
+  requires_reanalysis → True si verdict == MISMATCH o NOT_FOUND
+  summary             → string legible para logging/audit
+```
+
+### Cómo funciona el fat JAR inspection
+
+1. `find_artifact()` localiza el JAR más reciente en el directorio canónico del build tool detectado. Excluye `*-plain.jar` (Spring Boot thin JAR sin deps internas).
+2. `build_jar_index()` abre el ZIP y construye `{artifact_name_lower → ArtifactVersion}` inspeccionando entradas en `BOOT-INF/lib/` (Spring Boot), `WEB-INF/lib/` (WAR) o `lib/`.
+3. Para cada JAR anidado, intenta leer `pom.properties` dentro para obtener la versión canónica; si no está disponible, la extrae del nombre de fichero con `_JAR_NAME_RE`.
+4. `_fuzzy_lookup()` aplica matching exacto → prefijo → substring para manejar nombres parciales o abreviados.
+5. `_versions_equal()` normaliza qualifiers (`.Final`, `.RELEASE`, `.GA`, `.SP\d+`) antes de comparar versiones.
 
 ---
 
@@ -824,7 +898,7 @@ El servidor ya tiene soporte para `MCP_TRANSPORT=sse` en `config.py`. Con SSE se
 |---|---|---|---|
 | JavaScript / TypeScript | ✅ js_import_scanner | ✅ Express/Node patterns | Completo |
 | Java (Spring/Maven/Gradle) | ✅ java_import_scanner | ✅ Spring Boot patterns | Completo |
-| Kotlin (.kt) | ⚠️ Parcial (usa JS scanner) | ⚠️ Sin patterns específicos | Fix trivial: agregar .kt a _SOURCE_EXTENSIONS |
+| Kotlin (.kt) | ✅ java_import_scanner | ✅ Spring Boot patterns (idénticos a Java) | Completo |
 | Python | ❌ Sin scanner | ❌ | Pendiente |
 | Go | ❌ Sin scanner | ❌ | Pendiente |
 | Rust | ❌ Sin scanner | ❌ | Pendiente |
@@ -852,7 +926,6 @@ No se toca ninguna otra capa del sistema.
 | Regex vs AST — falsos positivos en strings/comentarios | Bajo impacto en práctica | `get_call_context` documenta limitación |
 | Confidencia heurística, no formal | NOT_REACHABLE < 0.70 requiere revisión humana | `requires_human_review` flag en resultado |
 | Ártefactos legacy sin mapping (javassist, cglib, woodstox) | Falso negativo para esas librerías | Agregar a `_LEGACY_IMPORT_MAPPINGS` |
-| Kotlin (.kt) no escaneado | Spring Boot 3.x subestimado | Agregar `.kt` a `_SOURCE_EXTENSIONS` |
 
 ---
 

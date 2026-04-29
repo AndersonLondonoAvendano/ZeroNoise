@@ -25,5 +25,12 @@ class Settings(BaseSettings):
     stage3_rate_limit_call: int = 100      # get_call_context
     stage3_rate_limit_symbol: int = 50     # find_symbol_usages
 
+    # OWASP Dependency-Check fast-gate — minimum CVSS to treat as gate blocker
+    gate_cvss_threshold: float = 7.0
+
 
 settings = Settings()
+
+
+def get_settings() -> Settings:
+    return settings

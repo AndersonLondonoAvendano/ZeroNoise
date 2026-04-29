@@ -36,7 +36,7 @@ _ANALYZER_NAME = "java_import_scanner"
 _ANALYZER_VERSION = "1.0.0"
 _RULESET_VERSION = "2025-04"
 
-_SOURCE_EXTENSIONS = frozenset({".java"})
+_SOURCE_EXTENSIONS = frozenset({".java", ".kt"})
 
 _SKIP_DIRS = frozenset({
     "target",                  # Maven build output
