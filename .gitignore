@@ -8,7 +8,19 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Credentials — never commit
 .env
-.env.example
+
+# Templates — sí commitear
+# .env.example  ← no ignorar, es plantilla sin credenciales reales
+
+# Proyectos vulnerables de prueba (datos sensibles, archivos grandes)
 vuln_projects/
+
+# Logs y outputs generados en runtime
 audit.log
+artifact_verification_result.json
+depcheck_gate_result.json
+dependency-check-report.json
+*-result.json
