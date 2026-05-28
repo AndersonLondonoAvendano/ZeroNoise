@@ -409,6 +409,33 @@ class DepCheckIngester:
             issues.append("Sin score CVSS — no evaluable automáticamente")
             needs_review = True
 
+        # Extraer rangos de versiones vulnerables del advisory
+        # El formato NVD en dep-check es:
+        #   {"software": {"id": "cpe:...", "versionEndExcluding": "4.1.132", ...}}
+        vuln_software_raw = vuln.get("vulnerableSoftware", [])
+        ranges = []
+        for vs in vuln_software_raw:
+            if not isinstance(vs, dict):
+                continue
+            sw = vs.get("software", {})
+            if not isinstance(sw, dict):
+                continue
+            v_start_incl = sw.get("versionStartIncluding", "")
+            v_start_excl = sw.get("versionStartExcluding", "")
+            v_end_excl   = sw.get("versionEndExcluding", "")
+            v_end_incl   = sw.get("versionEndIncluding", "")
+
+            if v_start_incl and v_end_excl:
+                ranges.append(f">= {v_start_incl}, < {v_end_excl}")
+            elif v_start_incl and v_end_incl:
+                ranges.append(f">= {v_start_incl}, <= {v_end_incl}")
+            elif v_start_excl and v_end_excl:
+                ranges.append(f"> {v_start_excl}, < {v_end_excl}")
+            elif v_end_excl:
+                ranges.append(f"< {v_end_excl}")
+            elif v_end_incl:
+                ranges.append(f"<= {v_end_incl}")
+
         return DepCheckFinding(
             cve_id=cve_id,
             severity=severity,
@@ -418,6 +445,7 @@ class DepCheckIngester:
             affected_packages=[package],
             identification_issues=issues,
             requires_human_review=needs_review,
+            vulnerable_software=ranges,
         )
 
     def _parse_cvss(self, vuln: dict) -> Optional[DepCheckCvss]:

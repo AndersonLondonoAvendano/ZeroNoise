@@ -20,6 +20,7 @@ from zeronoise.tools.reachability import (
     update_finding_analysis,
 )
 from zeronoise.tools.depcheck_gate import analyze_depcheck_report
+from zeronoise.tools.dt_background import analyze_project_vulnerabilities
 from zeronoise.tools.sbom_ingestion import (
     get_actionable_findings,
     get_project_findings,
@@ -56,6 +57,9 @@ mcp.tool()(generate_vex_report)
 
 # ── Dep-Check Fast Gate ───────────────────────────────────────────────────────
 mcp.tool()(analyze_depcheck_report)
+
+# ── DT Background Analysis (Stage 0 + Stage 2 + Stage 3) ─────────────────────
+mcp.tool()(analyze_project_vulnerabilities)
 
 
 # ── Resources ─────────────────────────────────────────────────────────────────

@@ -40,6 +40,10 @@ _STARTER_TO_LIBRARY: dict[str, str] = {
     "spring-boot-starter-logging":      "logback-classic",
     "spring-cloud-starter-openfeign":   "feign-core",
     "spring-cloud-starter-gateway":     "spring-cloud-gateway-core",
+    # Thymeleaf — múltiples módulos mapean al core
+    "thymeleaf-spring6":                "thymeleaf",
+    "thymeleaf-spring5":                "thymeleaf",
+    "thymeleaf-extras-springsecurity6": "thymeleaf",
 }
 
 # Maven: "[INFO] |  +- io.netty:netty-resolver-dns:jar:4.1.128.Final:compile"
@@ -151,7 +155,12 @@ class DependencyTreeParser:
     # ------------------------------------------------------------------
     def _parse_file(self, f: Path) -> dict[str, str]:
         index: dict[str, str] = {}
-        content = f.read_text(encoding="utf-8", errors="ignore")
+        raw = f.read_bytes()
+        # UTF-16 BOM detection — Gradle en Windows produce UTF-16 LE
+        if raw[:2] in (b'\xff\xfe', b'\xfe\xff'):
+            content = raw.decode('utf-16', errors='ignore')
+        else:
+            content = raw.decode('utf-8', errors='ignore')
         is_maven = "[INFO]" in content
         for line in content.splitlines():
             if is_maven:
@@ -240,6 +249,113 @@ class DependencyTreeParser:
             log.warning(f"Error ejecutando Gradle: {e}")
 
         return {}
+
+    def resolve_effective_version(
+        self,
+        artifact_name: str,
+        reported_version: str,
+    ) -> tuple[Optional[str], str]:
+        """
+        Resuelve la versión efectiva de un artifact en el árbol de dependencias.
+
+        Estrategia:
+          1. Búsqueda directa del artifact en el árbol
+          2. Si no está o es un wrapper, buscar sub-módulos relacionados
+             (ej: reactor-netty-core → todos los netty-* en el árbol)
+          3. Retornar la versión más representativa
+
+        Returns:
+            (effective_version, resolution_note)
+        """
+        tree = self.load_tree()
+        if not tree:
+            return None, "Árbol de dependencias no disponible"
+
+        name = artifact_name.lower()
+
+        direct = self._lookup(name, tree)
+        if direct and direct != reported_version:
+            return direct, (
+                f"Versión en árbol: {artifact_name}@{direct} "
+                f"(dep-check reportó {reported_version})"
+            )
+        if direct:
+            return direct, f"Versión confirmada en árbol: {artifact_name}@{direct}"
+
+        related = self._find_related_modules(name, tree)
+        if related:
+            versions = list(set(related.values()))
+            if len(versions) == 1:
+                return versions[0], (
+                    f"'{artifact_name}' resuelto via sub-módulos: "
+                    f"{dict(list(related.items())[:5])}. "
+                    f"Versión efectiva de los componentes: {versions[0]}"
+                )
+            else:
+                highest = self._highest_version(versions)
+                return highest, (
+                    f"'{artifact_name}' tiene sub-módulos con versiones mixtas: "
+                    f"{related}. Versión más alta encontrada: {highest}"
+                )
+
+        return None, (
+            f"'{artifact_name}' no encontrado en el árbol de dependencias runtime."
+        )
+
+    def _find_related_modules(
+        self,
+        base_name: str,
+        tree: dict[str, str],
+    ) -> dict[str, str]:
+        """
+        Busca módulos relacionados. Estrategia genérica sin hardcoding.
+
+        Extrae todas las palabras significativas del nombre del artifact
+        y busca coincidencias en el árbol, independientemente del framework
+        o ecosistema.
+        """
+        _REMOVE_SUFFIXES = [
+            "-core", "-api", "-impl", "-all", "-full",
+            "-starter", "-shaded", "-shadow", "-uber",
+            "-spring", "-spring5", "-spring6", "-spring-boot",
+            "-quarkus", "-micronaut", "-jakarta", "-javax",
+            "-http", "-https", "-web", "-rest", "-grpc",
+            "-client", "-server", "-common", "-base",
+            "-extensions", "-extension",
+        ]
+
+        clean = base_name.lower()
+        for suffix in _REMOVE_SUFFIXES:
+            if clean.endswith(suffix):
+                clean = clean[: -len(suffix)]
+
+        parts = re.split(r'[-_]', clean)
+        keywords = [p for p in parts if len(p) >= 4]
+
+        if not keywords:
+            return {}
+
+        related = {}
+        for keyword in keywords:
+            for key, version in tree.items():
+                if re.search(rf'(?:^|[-_]){re.escape(keyword)}(?:[-_]|$)', key):
+                    if key != base_name:
+                        related[key] = version
+
+        return related
+
+    def _highest_version(self, versions: list[str]) -> str:
+        """Retorna la versión más alta de una lista usando comparación numérica."""
+        def parse(v: str) -> tuple:
+            clean = re.sub(
+                r'\.(Final|RELEASE|GA|SP\d+|Alpha\d*|Beta\d*|RC\d*)$',
+                '', v, flags=re.IGNORECASE
+            )
+            try:
+                return tuple(int(x) for x in clean.split('.') if x.isdigit())
+            except ValueError:
+                return (0,)
+        return max(versions, key=parse)
 
     def _lookup(self, name: str, tree: dict) -> Optional[str]:
         n = name.lower()

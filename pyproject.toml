@@ -8,6 +8,7 @@ dependencies = [
     "anthropic>=0.96.0",
     "fastmcp>=3.2.4",
     "httpx>=0.28.1",
+    "packaging>=26.1",
     "pydantic-settings>=2.13.1",
 ]
 

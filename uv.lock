@@ -1231,6 +1231,7 @@ dependencies = [
     { name = "anthropic" },
     { name = "fastmcp" },
     { name = "httpx" },
+    { name = "packaging" },
     { name = "pydantic-settings" },
 ]
 
@@ -1239,6 +1240,7 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.96.0" },
     { name = "fastmcp", specifier = ">=3.2.4" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "packaging", specifier = ">=26.1" },
     { name = "pydantic-settings", specifier = ">=2.13.1" },
 ]
 

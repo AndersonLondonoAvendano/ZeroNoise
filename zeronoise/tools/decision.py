@@ -18,6 +18,13 @@ from zeronoise.config import settings
 from zeronoise.models.vulnerability import AnalysisJustification, VerdictTaxonomy
 
 
+# Instrucción de idioma para el LLM en Stage 3
+SPANISH_LANGUAGE_INSTRUCTION = (
+    "IMPORTANTE: Todas las justificaciones, análisis y comentarios deben estar "
+    "escritos en español. Los nombres técnicos (CVE IDs, nombres de paquetes, "
+    "PURLs, CWEs) se mantienen en su formato original."
+)
+
 # Maps Stage 2 verdict strings to VEX status values (OpenVEX compatible)
 _VEX_STATUS_MAP: dict[str, str] = {
     VerdictTaxonomy.NOT_REACHABLE: "not_affected",
@@ -215,9 +222,9 @@ async def generate_vex_report(
             "justification": f.get("justification", AnalysisJustification.NOT_SET),
             "impact_statement": f.get("analysis_details", ""),
             "action_statement": (
-                "No action required — package not reachable from application code."
+                "No se requiere acción — el paquete no es alcanzable desde el código de la aplicación."
                 if vex_status == "not_affected"
-                else "Investigate and remediate before deployment."
+                else "Investigar y remediar antes del despliegue."
             ),
             "confidence": f.get("confidence", 0.0),
             "evidence_count": len(f.get("evidence", [])),

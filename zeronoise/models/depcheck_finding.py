@@ -100,6 +100,10 @@ class DepCheckFinding:
     # Paquetes donde se detectó este CVE (deduplicados)
     affected_packages: list[AffectedPackage] = field(default_factory=list)
 
+    # Rangos de versiones afectadas extraídos del advisory del CVE
+    # Formato: ["< 4.1.132.Final", ">= 4.0.0"] o CPE strings
+    vulnerable_software: list[str]          = field(default_factory=list)
+
     # Diagnóstico de calidad del dato
     identification_issues: list[str]        = field(default_factory=list)
     requires_human_review: bool             = False

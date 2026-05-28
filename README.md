@@ -1,4 +1,4 @@
-# ZeroNoise 🛡️
+# ZeroNoise
 
 **ZeroNoise** es un motor de auditoría inteligente diseñado para eliminar el ruido y los falsos positivos en la gestión de vulnerabilidades. A diferencia de los escaneos tradicionales que solo reportan la presencia de una librería vulnerable, ZeroNoise utiliza Inteligencia Artificial y **Model Context Protocol (MCP)** para determinar la **explotabilidad real** basándose en el contexto específico de tu proyecto.
 
@@ -10,48 +10,79 @@ El problema común en la automatización con LLMs es el alto consumo de tokens y
 
 ## Estrategia de Reducción de Ruido
 
-ZeroNoise opera en tres capas lógicas para optimizar la precisión y el costo:
+ZeroNoise opera en cuatro capas lógicas para optimizar la precisión y el costo:
+
+### 0. Verificación de Artefacto (Stage 0)
+Antes de analizar cualquier CVE, verifica que la versión reportada por el scanner coincida con la versión **realmente empaquetada** en el fat JAR compilado y resuelta en el árbol de dependencias. Detecta:
+- Mismatches entre versión reportada y versión real
+- Starters de Spring Boot (la versión del starter ≠ la versión de la librería real)
+- Dependencias NOT_FOUND en el runtime (posibles falsos positivos)
 
 ### 1. Filtro de Entrada (Metadata-First)
-En lugar de procesar archivos fuente, el sistema ingiere metadatos del **SBOM** (vía Dependency-Track). Identificamos el CVE y, lo más importante, el punto de entrada específico (función o clase) que contiene la vulnerabilidad.
+En lugar de procesar archivos fuente, el sistema ingiere metadatos del **SBOM** (vía Dependency-Track) o del reporte JSON de **OWASP Dependency-Check**. Identificamos el CVE y el punto de entrada específico (función o clase) que contiene la vulnerabilidad.
 
 ### 2. Análisis de Alcanzabilidad (Reachability)
-Utilizamos herramientas de análisis estático (**Semgrep** / **CodeQL**) para generar un **Call Graph**. 
-* **La pregunta:** ¿Existe una ruta de ejecución real en nuestro código que invoque la función vulnerable?
-* **El resultado:** Si la función nunca se llama, la vulnerabilidad se marca automáticamente como `Not Affected` sin consumir tokens de análisis de código.
+Análisis estático basado en regex sobre el código fuente.
+* **La pregunta:** ¿Existe un import real de este paquete en el código de la aplicación?
+* **El resultado:** Si el paquete nunca se importa, la vulnerabilidad se marca automáticamente como `Not Affected` sin consumir tokens de análisis de código.
 
 ### 3. Deep Dive Contextual (Vía MCP)
-Si la función es alcanzable, la IA utiliza **Model Context Protocol (MCP)** para "auditar" fragmentos específicos:
+Si el paquete es alcanzable, la IA utiliza **Model Context Protocol (MCP)** para "auditar" fragmentos específicos:
 * Solicita solo los fragmentos de código relevantes (snippets).
 * Analiza si las entradas de usuario están sanitizadas.
 * Evalúa el entorno (controles de red, privilegios, exposición).
 
 ---
 
-## 🏗️ Arquitectura de la Solución
+## Arquitectura de la Solución
 
 | Componente | Función | Impacto en Tokens |
 | :--- | :--- | :--- |
-| **Artifact Inspector (Stage 0)** | Verifica la versión real empaquetada en el fat JAR vs. la versión reportada por el scanner. Detecta mismatches y falsos positivos por versión antes de Stage 1. | **Cero** (filesystem local) |
-| **SCA (Dependency-Track)** | Ingesta de SBOM y detección de CVEs. | **Cero** (API local) |
-| **Static Analyzer** | Generación de Call Graph (Mapa de llamadas). | **Cero** |
-| **Orquestador (MCP)** | Decide qué CVEs investigar según el mapa. | **Mínimo** (Metadatos JSON) |
-| **Agente de Auditoría** | Inspección lógica de fragmentos de código. | **Moderado** (Snippets específicos) |
+| **ArtifactInspector (Stage 0)** | Verifica la versión real empaquetada en el fat JAR vs. la versión reportada. Detecta mismatches y falsos positivos por versión. | **Cero** (filesystem local) |
+| **DependencyTreeParser (Stage 0)** | Parsea el árbol de dependencias Maven/Gradle. Resuelve la versión efectiva para starters y transitive deps. Genera el árbol automáticamente si no existe. | **Cero** (filesystem local) |
+| **SCA (Dependency-Track / OWASP Dep-Check)** | Ingesta de SBOM y detección de CVEs desde dos fuentes. | **Cero** (API local / archivo JSON) |
+| **ImportScanner (Stage 2)** | Análisis regex de importaciones en JavaScript/TypeScript, Java y Kotlin. | **Cero** |
+| **ProjectContextReader** | Lee README, configuración de build y YAML de la aplicación para enriquecer el contexto del LLM. | **Cero** (filesystem local) |
+| **Orquestador (MCP)** | Decide qué CVEs investigar según el análisis de alcanzabilidad. | **Mínimo** (Metadatos JSON) |
+| **Agente de Auditoría (Stage 3)** | Inspección lógica de fragmentos de código con señales pre-análisis. | **Moderado** (Snippets específicos) |
 
 ---
 
-## 🛠️ Integración en el Pipeline (The Gatekeeper)
+## Dos Frentes Operacionales
+
+### Frente 1 — Dependency-Track (post-SBOM)
+Consume findings directamente desde la API de DT. Útil cuando DT ya está integrado en el pipeline.
+
+```
+DT API → Stage 1 → Stage 0 → Stage 2 → Stage 3 → VEX Report
+```
+
+Tool: `analyze_project_vulnerabilities`
+
+### Frente 2 — OWASP Dependency-Check (fast-gate de CI/CD)
+Consume el reporte JSON generado por OWASP Dep-Check directamente en el pipeline, sin servidor externo.
+
+```
+dep-check.json → Stage 0 → Stage 2 → Stage 3 → pipeline_decision (BLOCK | PROMOTE)
+```
+
+Tool: `analyze_depcheck_report`
+
+---
+
+## Integración en el Pipeline (The Gatekeeper)
 
 ZeroNoise actúa como un **Security Gatekeeper** en tu flujo de CI/CD:
 
 1. **Trigger:** Se activa cuando un scan de seguridad detecta vulnerabilidades críticas.
 2. **Evaluación:** La IA audita la alcanzabilidad y el contexto.
-3. **Veredicto:** * ✅ **Promote:** Genera un archivo **VEX (Vulnerability Exploitability eXchange)** justificando el falso positivo y permitiendo el despliegue.
+3. **Veredicto:**
+   * ✅ **Promote:** Genera un archivo **VEX (Vulnerability Exploitability eXchange)** justificando el falso positivo y permitiendo el despliegue.
    * ❌ **Block:** Confirma el riesgo real y detiene el pipeline con un informe técnico detallado.
 
 ---
 
-## 🎯 Objetivos del Proyecto
+## Objetivos del Proyecto
 
 * **Cero Falsos Positivos:** Reducir la carga de trabajo manual del equipo de seguridad.
 * **Justificación de Riesgo:** No solo entregamos un score, entregamos un "por qué".
@@ -84,4 +115,4 @@ ZeroNoise analiza código fuente empresarial confidencial y es consumido por LLM
 
 ---
 
-> **Estado del Proyecto:** Stage 0 (verificación de artefacto), Stage 1, Stage 2 y Stage 3 implementados y validados. Controles de seguridad CIA implementados. Lenguajes soportados: JavaScript/TypeScript, Java (Spring/Maven/Gradle) y Kotlin.
+> **Estado del Proyecto:** Stage 0 (verificación de artefacto + árbol de dependencias), Stage 1, Stage 2 y Stage 3 implementados y validados. Dos frentes operacionales: Dependency-Track y OWASP Dep-Check. 17 MCP tools + 4 resources. Lenguajes soportados: JavaScript/TypeScript, Java (Spring/Maven/Gradle) y Kotlin.

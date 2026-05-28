@@ -27,7 +27,7 @@
 - [ HECHO ] 03 B1B2 Artifact Inspector
 - [ HECHO ] 04 B1B2 Dep Tree Parser
 - [ HECHO ] 05 B1B2 Stage 0 Integration
-- [ ] 06 B1B2 POC Artifact
+- [ HECHO ] 06 B1B2 POC Artifact
 - [ ] 07 B3 DT Background Tool
 - [ ] 08 B3 POC DT Background
 - [ ] 09 B4 SSE Auth
